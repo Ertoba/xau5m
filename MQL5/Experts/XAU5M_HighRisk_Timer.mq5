@@ -44,7 +44,7 @@ input double RSIUpperBias            = 55.0;
 input double RSILowerBias            = 45.0;
 
 //-------------------- Risk controls --------------------
-input bool   UseSpreadFilter         = true;
+input bool   UseSpreadFilter         = false;
 input double MaxSpreadPoints         = 300.0;
 input double ATRStopMultiplier       = 1.00;
 input double ATRTakeProfitMultiplier = 1.20;

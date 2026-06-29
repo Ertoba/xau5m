@@ -38,7 +38,7 @@ Even though the strategy is high risk, the EA keeps basic safety guards:
 - `RequireDemoAccount = true`
 - XAUUSD-only symbol check
 - max 5 positions by EA magic number
-- spread filter, configurable and widened by default
+- optional spread filter, disabled by default for stress testing
 - margin check before opening orders
 - skip-reason logging in the MT5 Experts tab
 
