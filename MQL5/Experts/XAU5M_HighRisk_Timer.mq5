@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                           XAU5M_HighRisk_Timer.mq5 |
 //|  Aggressive XAUUSD M5 timer EA for demo/stress testing only.      |
-//|  Opens one 0.10 lot position per new M5 candle, max 5 positions.  |
+//|  Opens one 0.10 lot position per 5-minute server-time slot.       |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
+#property version   "1.01"
 #property description "High-risk XAUUSD M5 timer scalper for demo testing"
 
 #include <Trade\Trade.mqh>
@@ -27,6 +27,10 @@ input int    OpenEveryMinutes        = 5;
 input int    MaxOpenPositions        = 5;
 input double Lots                    = 0.10;
 input int    SlippagePoints          = 30;
+input bool   CloseOldestWhenFull     = true;
+input bool   RetryWithinSameSlotOnFailure = true;
+input bool   LogSkipReasons          = true;
+input int    SkipLogSeconds          = 60;
 
 //-------------------- Aggressive M5 signal score --------------------
 input int    EMAFastPeriod           = 20;
@@ -41,7 +45,7 @@ input double RSILowerBias            = 45.0;
 
 //-------------------- Risk controls --------------------
 input bool   UseSpreadFilter         = true;
-input double MaxSpreadPoints         = 120.0;
+input double MaxSpreadPoints         = 300.0;
 input double ATRStopMultiplier       = 1.00;
 input double ATRTakeProfitMultiplier = 1.20;
 input int    MinStopPoints           = 250;
@@ -62,8 +66,8 @@ int      HandleSlowMA = INVALID_HANDLE;
 int      HandleRSI = INVALID_HANDLE;
 int      HandleMACD = INVALID_HANDLE;
 int      HandleATR = INVALID_HANDLE;
-datetime LastOpenBarTime = 0;
-datetime LastOpenAttemptTime = 0;
+long     LastOpenSlot = -1;
+datetime LastSkipLogTime = 0;
 
 //+------------------------------------------------------------------+
 bool IsAllowedSymbol()
@@ -142,22 +146,60 @@ double SpreadPoints()
 }
 
 //+------------------------------------------------------------------+
-bool TradingEnvironmentOK()
+void LogSkip(string reason)
 {
-   if(!IsAllowedSymbol())
-      return false;
+   if(!LogSkipReasons)
+      return;
 
-   if(RequireDemoAccount && AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
+   datetime now = TimeCurrent();
+   if(LastSkipLogTime > 0 && now - LastSkipLogTime < SkipLogSeconds)
+      return;
+
+   LastSkipLogTime = now;
+   Print("Scheduled open skipped: ", reason);
+}
+
+//+------------------------------------------------------------------+
+long CurrentScheduleSlot()
+{
+   int seconds = MathMax(1, OpenEveryMinutes) * 60;
+   return (long)(TimeCurrent() / seconds);
+}
+
+//+------------------------------------------------------------------+
+bool TradingEnvironmentOK(string &reason)
+{
+   reason = "";
+
+   if(!IsAllowedSymbol())
    {
-      Print("EA stopped: RequireDemoAccount=true and this is not a demo account.");
+      reason = "current chart symbol is not allowed";
       return false;
    }
 
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+   if(RequireDemoAccount && AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
+   {
+      reason = "RequireDemoAccount=true and this is not a demo account";
       return false;
+   }
+
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+   {
+      reason = "terminal Algo Trading is disabled";
+      return false;
+   }
+
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+   {
+      reason = "EA is not allowed to trade in its Common settings";
+      return false;
+   }
 
    if(UseSpreadFilter && SpreadPoints() > MaxSpreadPoints)
+   {
+      reason = StringFormat("spread %.1f points exceeds limit %.1f", SpreadPoints(), MaxSpreadPoints);
       return false;
+   }
 
    return true;
 }
@@ -177,6 +219,43 @@ int CountOpenPositions()
    }
 
    return count;
+}
+
+//+------------------------------------------------------------------+
+bool CloseOldestManagedPosition()
+{
+   bool found = false;
+   datetime oldestTime = 0;
+   ulong oldestTicket = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!Position.SelectByIndex(i))
+         continue;
+
+      if(Position.Symbol() != _Symbol || (ulong)Position.Magic() != MagicNumber)
+         continue;
+
+      datetime posTime = (datetime)Position.Time();
+      if(!found || posTime < oldestTime)
+      {
+         found = true;
+         oldestTime = posTime;
+         oldestTicket = Position.Ticket();
+      }
+   }
+
+   if(!found || oldestTicket == 0)
+      return false;
+
+   bool closed = Trade.PositionClose(oldestTicket);
+   if(closed)
+      PrintFormat("Closed oldest position %I64u to free one slot before scheduled open.", oldestTicket);
+   else
+      PrintFormat("Failed to close oldest position %I64u: retcode=%u %s",
+                  oldestTicket, Trade.ResultRetcode(), Trade.ResultRetcodeDescription());
+
+   return closed;
 }
 
 //+------------------------------------------------------------------+
@@ -308,31 +387,66 @@ bool StopsAreValid(double entry, double sl, double tp)
 //+------------------------------------------------------------------+
 bool OpenScheduledPosition()
 {
-   if(!TradingEnvironmentOK())
+   long slot = CurrentScheduleSlot();
+   if(slot == LastOpenSlot)
       return false;
 
-   if(CountOpenPositions() >= MaxOpenPositions)
+   string reason = "";
+   if(!TradingEnvironmentOK(reason))
+   {
+      LogSkip(reason);
       return false;
+   }
+
+   int openPositions = CountOpenPositions();
+   if(openPositions >= MaxOpenPositions)
+   {
+      if(CloseOldestWhenFull)
+      {
+         if(!CloseOldestManagedPosition())
+         {
+            LogSkip("max open positions reached and oldest position could not be closed");
+            return false;
+         }
+      }
+      else
+      {
+         LogSkip(StringFormat("max open positions reached: %d/%d", openPositions, MaxOpenPositions));
+         return false;
+      }
+   }
 
    datetime currentBarTime = iTime(_Symbol, EntryTimeframe, 0);
-   if(currentBarTime == 0 || currentBarTime == LastOpenBarTime)
+   if(currentBarTime == 0)
+   {
+      LogSkip("no entry timeframe data yet");
       return false;
-
-   if(LastOpenAttemptTime > 0 && TimeCurrent() - LastOpenAttemptTime < OpenEveryMinutes * 60)
-      return false;
+   }
 
    double atr = BufferValue(HandleATR, 0, 1);
    if(atr == EMPTY_VALUE || atr <= 0.0)
+   {
+      LogSkip("ATR value is not ready yet");
       return false;
+   }
 
    int direction = (DirectionScore() >= 0 ? 1 : -1);
    CloseOpposite(direction);
 
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
+   {
+      LogSkip("no current market tick");
       return false;
+   }
 
    double volume = NormalizeVolume(Lots);
+   if(volume <= 0.0)
+   {
+      LogSkip("normalized lot volume is zero");
+      return false;
+   }
+
    double stopDistance = ATRStopMultiplier * atr;
    double minStop = MinStopPoints * _Point;
    double maxStop = MaxStopPoints * _Point;
@@ -360,15 +474,25 @@ bool OpenScheduledPosition()
    tp = NormalizePrice(tp);
 
    if(!StopsAreValid(entry, sl, tp))
+   {
+      LogSkip("SL/TP distance is below broker stop level");
       return false;
+   }
 
    double margin = 0.0;
    ENUM_ORDER_TYPE orderType = (direction > 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
    if(!OrderCalcMargin(orderType, _Symbol, volume, entry, margin))
+   {
+      LogSkip(StringFormat("OrderCalcMargin failed, error=%d", GetLastError()));
       return false;
+   }
 
    if(AccountInfoDouble(ACCOUNT_MARGIN_FREE) <= margin * 1.10)
+   {
+      LogSkip(StringFormat("not enough free margin: need %.2f, free %.2f",
+                           margin * 1.10, AccountInfoDouble(ACCOUNT_MARGIN_FREE)));
       return false;
+   }
 
    bool sent = false;
    if(direction > 0)
@@ -376,18 +500,18 @@ bool OpenScheduledPosition()
    else
       sent = Trade.Sell(volume, _Symbol, 0.0, sl, tp, TradeComment);
 
-   LastOpenAttemptTime = TimeCurrent();
-
    if(sent)
    {
-      LastOpenBarTime = currentBarTime;
-      PrintFormat("%s opened by timer: lot=%.2f score=%d sl=%.2f tp=%.2f",
-                  direction > 0 ? "BUY" : "SELL", volume, DirectionScore(), sl, tp);
+      LastOpenSlot = slot;
+      PrintFormat("%s opened by 5-minute schedule: lot=%.2f score=%d slot=%I64d sl=%.2f tp=%.2f",
+                  direction > 0 ? "BUY" : "SELL", volume, DirectionScore(), slot, sl, tp);
    }
    else
    {
       PrintFormat("Order failed: retcode=%u %s",
                   Trade.ResultRetcode(), Trade.ResultRetcodeDescription());
+      if(!RetryWithinSameSlotOnFailure)
+         LastOpenSlot = slot;
    }
 
    return sent;

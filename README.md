@@ -10,11 +10,11 @@ High-risk MetaTrader 5 Expert Advisor for XAUUSD M5 demo/stress testing.
 - Timeframe logic: M5
 - Default lot size: `0.10`
 - Max simultaneous positions: `5`
-- Schedule: attempts to open one position on each new M5 candle
+- Schedule: attempts to open one position in each 5-minute server-time slot
 
 ## Logic
 
-This EA is intentionally aggressive. It opens a new 0.10 lot position every 5 minutes while the EA has fewer than 5 open positions.
+This EA is intentionally aggressive. It attempts to open a new 0.10 lot position every 5 minutes. If 5 EA-managed positions are already open, the default behavior closes the oldest managed position first, then opens a new one.
 
 Direction is selected by a momentum/trend score using:
 
@@ -38,8 +38,9 @@ Even though the strategy is high risk, the EA keeps basic safety guards:
 - `RequireDemoAccount = true`
 - XAUUSD-only symbol check
 - max 5 positions by EA magic number
-- spread filter
+- spread filter, configurable and widened by default
 - margin check before opening orders
+- skip-reason logging in the MT5 Experts tab
 
 This is not financial advice. Do not use on a live account without rewriting and backtesting the risk model.
 
@@ -53,6 +54,7 @@ Key inputs:
 Lots = 0.10
 OpenEveryMinutes = 5
 MaxOpenPositions = 5
+CloseOldestWhenFull = true
 MaxHoldMinutes = 25
 ATRStopMultiplier = 1.00
 ATRTakeProfitMultiplier = 1.20
